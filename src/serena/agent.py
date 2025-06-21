@@ -803,7 +803,7 @@ class SerenaAgent:
         self.symbol_manager: SymbolManager | None = None
         self.memories_manager: MemoriesManager | None = None
         self.lines_read: LinesRead | None = None
-        self.ignore_spec: PathSpec  # not set to None to avoid assert statements
+        self.ignore_spec: PathSpec | None = None  # will be set during lazy language server initialization
         """Ignore spec, extracted from the project's gitignore files and the explicitly configured ignored paths."""
 
         # Apply context and mode tool configurations
@@ -864,6 +864,9 @@ class SerenaAgent:
         if len(relative_path.parts) > 0 and relative_path.parts[0] == ".git":
             return True
 
+        # Ensure ignore_spec is ready (requires language server)
+        self._ensure_language_server_ready()
+        assert self.ignore_spec is not None
         return match_path(str(relative_path), self.ignore_spec)
 
     def validate_relative_path(self, relative_path: str) -> None:
@@ -959,19 +962,43 @@ class SerenaAgent:
         self._active_project = project
         self._update_active_tools()
 
-        # start the language server
-        self.reset_language_server()
-        assert self.language_server is not None
-        self.ignore_spec = self.language_server.get_ignore_spec()
+        # DON'T start language server immediately - defer to lazy loading
+        # Language server will be initialized when first semantic tool is used
 
-        # initialize project-specific instances
-        log.debug(f"Initializing symbol and memories manager for {project.project_name} at {project.project_root}")
-        self.symbol_manager = SymbolManager(self.language_server, self)
+        # Initialize components that don't require language server
+        self.ignore_spec = None  # Will be set during lazy language server initialization
+        self.symbol_manager = None  # Will be set during lazy language server initialization
+
+        # Initialize non-language-server dependent components
+        log.debug(f"Initializing memories manager for {project.project_name} at {project.project_root}")
         self.memories_manager = MemoriesManagerMDFilesInProject(project.project_root)
         self.lines_read = LinesRead()
 
         if self._project_activation_callback is not None:
             self._project_activation_callback()
+
+    def _ensure_language_server_ready(self) -> None:
+        """
+        Ensure language server and dependent components are initialized lazily.
+        This method is called by semantic tools on first access to language_server or symbol_manager.
+        """
+        if self.language_server is not None and self.language_server.is_running():
+            return  # Already running, nothing to do
+
+        log.info("Initializing language server lazily for first semantic tool use")
+
+        # Start language server (same logic as before, just deferred)
+        self.reset_language_server()
+        assert self.language_server is not None
+
+        # Initialize dependent components that were deferred
+        self.ignore_spec = self.language_server.get_ignore_spec()
+
+        if self.symbol_manager is None:
+            log.debug("Initializing symbol manager after language server startup")
+            self.symbol_manager = SymbolManager(self.language_server, self)
+
+        log.info("Language server and dependent components initialized successfully")
 
     def activate_project_from_path_or_name(self, project_root_or_name: str) -> tuple[Project, bool, bool]:
         """
@@ -1146,6 +1173,8 @@ class Component(ABC):
 
     @property
     def language_server(self) -> SyncLanguageServer:
+        # Ensure language server is ready before returning it
+        self.agent._ensure_language_server_ready()
         assert self.agent.language_server is not None
         return self.agent.language_server
 
@@ -1166,6 +1195,8 @@ class Component(ABC):
 
     @property
     def symbol_manager(self) -> SymbolManager:
+        # Ensure language server is ready (symbol manager depends on it)
+        self.agent._ensure_language_server_ready()
         assert self.agent.symbol_manager is not None
         return self.agent.symbol_manager
 
@@ -1346,9 +1377,8 @@ class Tool(Component, ToolInterface):
                         "Error: No active project. Ask to user to select a project from this list: "
                         + f"{self.agent.serena_config.project_names}"
                     )
-                if not self.agent.is_language_server_running():
-                    log.info("Language server is not running. Starting it ...")
-                    self.agent.reset_language_server()
+                # Language server initialization is now handled lazily by Component properties
+                # when tools access self.language_server or self.symbol_manager
 
             # apply the actual tool with a timeout
             execution_fn = lambda: apply_fn(**kwargs)
@@ -1373,10 +1403,12 @@ class Tool(Component, ToolInterface):
         if log_call:
             log.info(f"Result: {result}")
 
-        try:
-            self.language_server.save_cache()
-        except Exception as e:
-            log.error(f"Error saving language server cache: {e}")
+        # Only save cache if language server is running
+        if self.agent.is_language_server_running():
+            try:
+                self.language_server.save_cache()
+            except Exception as e:
+                log.error(f"Error saving language server cache: {e}")
 
         return result
 
